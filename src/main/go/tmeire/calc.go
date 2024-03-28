@@ -1,16 +1,18 @@
 package main
 
 import (
-	"bufio"
+	"errors"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"math"
 	"os"
 	"runtime/pprof"
 	"sort"
-	"strings"
 )
 
 type measurement struct {
+	name                 string
 	min, max, sum, count int64
 }
 
@@ -30,53 +32,79 @@ func main() {
 		panic("missing measurements filename")
 	}
 
-	data := make(map[string]*measurement)
+	data := make(map[uint64]*measurement)
 
-	file, err := os.Open("measurements.txt")
+	file, err := os.Open(os.Args[1])
 	if err != nil {
 		panic(err)
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.Split(line, ";")
-		name := parts[0]
-		tempStr := strings.Trim(parts[1], "\n")
+	h := fnv.New64a()
 
-		temperature := int64(parseTemperature(tempStr))
+	// TODO: see if this can be further optimised, reads don't show up in the trace though
+	b := make([]byte, 1024*1024*1024)
 
-		station, ok := data[name]
-		if !ok {
-			data[name] = &measurement{temperature, temperature, temperature, 1}
-		} else {
-			if temperature < station.min {
-				station.min = temperature
+	var offset int
+	for {
+		n, err := file.Read(b[offset:])
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				panic(err)
 			}
-			if temperature > station.max {
-				station.max = temperature
-			}
-			station.sum += temperature
-			station.count++
+			break
 		}
+
+		var ns, ne int
+		for i := 0; i < len(b[:offset+n]); i++ {
+			switch b[i] {
+			case ';':
+				ne = i
+			case '\n':
+				name := b[ns:ne]
+				temperature := int64(parseTemperature(b[ne+1 : i]))
+
+				h.Reset()
+				h.Write(name)
+				id := h.Sum64()
+
+				station, ok := data[id]
+				if !ok {
+					data[id] = &measurement{string(name), temperature, temperature, temperature, 1}
+				} else {
+					if temperature < station.min {
+						station.min = temperature
+					}
+					if temperature > station.max {
+						station.max = temperature
+					}
+					station.sum += temperature
+					station.count++
+				}
+				ns = i + 1
+			}
+		}
+		copy(b[0:offset+n-ns], b[ns:offset+n])
+		offset = offset + n - ns
 	}
 
+	indexes := make(map[string]uint64)
 	keys := make([]string, 0, len(data))
-	for key := range data {
-		keys = append(keys, key)
+	for id, m := range data {
+		keys = append(keys, m.name)
+		indexes[m.name] = id
 	}
 	sort.Strings(keys)
 
 	print("{")
 	for _, k := range keys {
-		v := data[k]
+		v := data[indexes[k]]
 		fmt.Printf("%s=%.1f/%.1f/%.1f, ", k, float64(v.min)/10., math.Round(float64(v.sum)/float64(v.count))/10., float64(v.max)/10.)
 	}
 	print("}\n")
 }
 
-func parseTemperature(temp string) int64 {
+func parseTemperature(temp []byte) int64 {
 	var n int64
 	n += int64(temp[len(temp)-1] - '0')
 	// -2 is the .
