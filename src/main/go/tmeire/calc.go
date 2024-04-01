@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime/pprof"
 	"sort"
+	"sync"
 )
 
 type measurement struct {
@@ -79,10 +80,12 @@ const blockSize = 1024 * 1024 * 1024
 func collectData(file io.Reader) map[uint64]*measurement {
 	data := make(map[uint64]*measurement)
 
+	var wg sync.WaitGroup
+	results := make(chan map[uint64]*measurement)
+
 	var offset int
 	var b1 = make([]byte, blockSize)
 	var b2 []byte
-	blockCount := 0
 	for {
 		// Read the next block of the file
 		n, err := file.Read(b1[offset:])
@@ -103,7 +106,24 @@ func collectData(file io.Reader) map[uint64]*measurement {
 		}
 
 		// Parse the block until the last full measurement & merge it into the main dataset
-		res := process(b1[:ns+1])
+		wg.Add(1)
+		go func(block []byte) {
+			results <- process(block)
+			wg.Done()
+		}(b1[:ns+1])
+
+		// Create a new block for the next goroutine
+		b2, b1 = b1, make([]byte, 1024*1024*1024)
+		copy(b1[0:(offset+n)-(ns+1)], b2[ns+1:offset+n])
+		offset = (offset + n) - (ns + 1)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for res := range results {
 		for id, m := range res {
 			station, ok := data[id]
 			if !ok {
@@ -112,26 +132,12 @@ func collectData(file io.Reader) map[uint64]*measurement {
 				station.Merge(m)
 			}
 		}
-
-		// Create a new block for the next goroutine
-		b2, b1 = b1, make([]byte, 1024*1024*1024)
-		copy(b1[0:(offset+n)-(ns+1)], b2[ns+1:offset+n])
-		offset = (offset + n) - (ns + 1)
-		blockCount++
 	}
 	return data
 }
 
 func process(b []byte) map[uint64]*measurement {
 	data := make(map[uint64]*measurement)
-	if len(b) == 0 || (len(b) == 1 && b[0] == '\n') {
-		return nil
-	}
-
-	// if ok, err := regexp.Match(`([^;]+;[0-9]{1,2}.[0-9]\n)+`, b); err != nil || !ok {
-	// 	println(err)
-	// 	panic(string(b))
-	// }
 
 	var h = fnv.New64a()
 
