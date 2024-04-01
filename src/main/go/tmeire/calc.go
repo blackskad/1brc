@@ -32,13 +32,18 @@ func main() {
 		panic("missing measurements filename")
 	}
 
-	data := make(map[uint64]*measurement)
-
 	file, err := os.Open(os.Args[1])
 	if err != nil {
 		panic(err)
 	}
 	defer file.Close()
+
+	data := collectData(file)
+	printMeasurements(data)
+}
+
+func collectData(file io.Reader) map[uint64]*measurement {
+	data := make(map[uint64]*measurement)
 
 	h := fnv.New64a()
 
@@ -87,7 +92,11 @@ func main() {
 		copy(b[0:offset+n-ns], b[ns:offset+n])
 		offset = offset + n - ns
 	}
+	return data
+}
 
+func printMeasurements(data map[uint64]*measurement) {
+	// Not worth optimizing at this point
 	indexes := make(map[string]uint64)
 	keys := make([]string, 0, len(data))
 	for id, m := range data {
