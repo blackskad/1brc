@@ -16,6 +16,37 @@ type measurement struct {
 	min, max, sum, count int64
 }
 
+func (m *measurement) Print() {
+	fmt.Printf("%s=%.1f/%.1f/%.1f, ",
+		m.name,
+		float64(m.min)/10.,
+		math.Round(float64(m.sum)/float64(m.count))/10.,
+		float64(m.max)/10.,
+	)
+}
+
+func (m *measurement) Add(temperature int64) {
+	if temperature < m.min {
+		m.min = temperature
+	}
+	if temperature > m.max {
+		m.max = temperature
+	}
+	m.sum += temperature
+	m.count++
+}
+
+func (m *measurement) Merge(m1 *measurement) {
+	if m1.min < m.min {
+		m.min = m1.min
+	}
+	if m1.max > m.max {
+		m.max = m1.max
+	}
+	m.sum += m1.sum
+	m.count += m1.count
+}
+
 func main() {
 	f, err := os.Create("cpu_profile.prof")
 	if err != nil {
@@ -42,17 +73,19 @@ func main() {
 	printMeasurements(data)
 }
 
+// TODO: see if this can be further optimised, reads don't show up in the trace though
+const blockSize = 1024 * 1024 * 1024
+
 func collectData(file io.Reader) map[uint64]*measurement {
 	data := make(map[uint64]*measurement)
 
-	h := fnv.New64a()
-
-	// TODO: see if this can be further optimised, reads don't show up in the trace though
-	b := make([]byte, 1024*1024*1024)
-
 	var offset int
+	var b1 = make([]byte, blockSize)
+	var b2 []byte
+	blockCount := 0
 	for {
-		n, err := file.Read(b[offset:])
+		// Read the next block of the file
+		n, err := file.Read(b1[offset:])
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				panic(err)
@@ -60,37 +93,69 @@ func collectData(file io.Reader) map[uint64]*measurement {
 			break
 		}
 
-		var ns, ne int
-		for i := 0; i < len(b[:offset+n]); i++ {
-			switch b[i] {
-			case ';':
-				ne = i
-			case '\n':
-				name := b[ns:ne]
-				temperature := int64(parseTemperature(b[ne+1 : i]))
-
-				h.Reset()
-				h.Write(name)
-				id := h.Sum64()
-
-				station, ok := data[id]
-				if !ok {
-					data[id] = &measurement{string(name), temperature, temperature, temperature, 1}
-				} else {
-					if temperature < station.min {
-						station.min = temperature
-					}
-					if temperature > station.max {
-						station.max = temperature
-					}
-					station.sum += temperature
-					station.count++
-				}
-				ns = i + 1
+		// Find the end of the last full measurement
+		ns := offset + n - 1
+		for i := ns; i >= 0; i-- {
+			if b1[i] == '\n' {
+				ns = i
+				break
 			}
 		}
-		copy(b[0:offset+n-ns], b[ns:offset+n])
-		offset = offset + n - ns
+
+		// Parse the block until the last full measurement & merge it into the main dataset
+		res := process(b1[:ns+1])
+		for id, m := range res {
+			station, ok := data[id]
+			if !ok {
+				data[id] = m
+			} else {
+				station.Merge(m)
+			}
+		}
+
+		// Create a new block for the next goroutine
+		b2, b1 = b1, make([]byte, 1024*1024*1024)
+		copy(b1[0:(offset+n)-(ns+1)], b2[ns+1:offset+n])
+		offset = (offset + n) - (ns + 1)
+		blockCount++
+	}
+	return data
+}
+
+func process(b []byte) map[uint64]*measurement {
+	data := make(map[uint64]*measurement)
+	if len(b) == 0 || (len(b) == 1 && b[0] == '\n') {
+		return nil
+	}
+
+	// if ok, err := regexp.Match(`([^;]+;[0-9]{1,2}.[0-9]\n)+`, b); err != nil || !ok {
+	// 	println(err)
+	// 	panic(string(b))
+	// }
+
+	var h = fnv.New64a()
+
+	var ns, ne int
+	for i := 0; i < len(b); i++ {
+		switch b[i] {
+		case ';':
+			ne = i
+		case '\n':
+			name := b[ns:ne]
+			temperature := int64(parseTemperature(b[ne+1 : i]))
+
+			h.Reset()
+			h.Write(name)
+			id := h.Sum64()
+
+			station, ok := data[id]
+			if !ok {
+				data[id] = &measurement{string(name), temperature, temperature, temperature, 1}
+			} else {
+				station.Add(temperature)
+			}
+			ns = i + 1
+		}
 	}
 	return data
 }
@@ -107,8 +172,7 @@ func printMeasurements(data map[uint64]*measurement) {
 
 	print("{")
 	for _, k := range keys {
-		v := data[indexes[k]]
-		fmt.Printf("%s=%.1f/%.1f/%.1f, ", k, float64(v.min)/10., math.Round(float64(v.sum)/float64(v.count))/10., float64(v.max)/10.)
+		data[indexes[k]].Print()
 	}
 	print("}\n")
 }
