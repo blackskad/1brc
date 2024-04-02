@@ -6,7 +6,9 @@ import (
 	"hash/fnv"
 	"io"
 	"math"
+	_ "net/http/pprof"
 	"os"
+	"runtime"
 	"runtime/pprof"
 	"sort"
 	"sync"
@@ -60,6 +62,10 @@ func main() {
 	}
 	defer pprof.StopCPUProfile()
 
+	// go func() {
+	// 	log.Println(http.ListenAndServe("localhost:6060", nil))
+	// }()
+
 	if len(os.Args) != 2 {
 		panic("missing measurements filename")
 	}
@@ -78,10 +84,37 @@ func main() {
 const blockSize = 1024 * 1024 * 1024
 
 func collectData(file io.Reader) map[uint64]*measurement {
-	data := make(map[uint64]*measurement)
-
 	var wg sync.WaitGroup
 	results := make(chan map[uint64]*measurement)
+
+	// Spin up a limited number of goroutines to limit scheduling issues between them
+	inputs := make(chan []byte)
+	for i := 0; i < runtime.NumCPU()-1; i++ {
+		wg.Add(1)
+		go func() {
+			for input := range inputs {
+				results <- process(input)
+			}
+			wg.Done()
+		}()
+	}
+
+	// One goroutine to collect all the result sets into one
+	done := make(chan struct{})
+	data := make(map[uint64]*measurement)
+	go func() {
+		for res := range results {
+			for id, m := range res {
+				station, ok := data[id]
+				if !ok {
+					data[id] = m
+				} else {
+					station.Merge(m)
+				}
+			}
+		}
+		close(done)
+	}()
 
 	var offset int
 	var b1 = make([]byte, blockSize)
@@ -106,33 +139,20 @@ func collectData(file io.Reader) map[uint64]*measurement {
 		}
 
 		// Parse the block until the last full measurement & merge it into the main dataset
-		wg.Add(1)
-		go func(block []byte) {
-			results <- process(block)
-			wg.Done()
-		}(b1[:ns+1])
+		inputs <- b1[:ns+1]
 
 		// Create a new block for the next goroutine
 		b2, b1 = b1, make([]byte, 1024*1024*1024)
 		copy(b1[0:(offset+n)-(ns+1)], b2[ns+1:offset+n])
 		offset = (offset + n) - (ns + 1)
 	}
+	close(inputs)
 
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
+	// Wait until all processing goroutines have finished, then close the results channel to make sure the collection goroutine can quit as well
+	wg.Wait()
+	close(results)
 
-	for res := range results {
-		for id, m := range res {
-			station, ok := data[id]
-			if !ok {
-				data[id] = m
-			} else {
-				station.Merge(m)
-			}
-		}
-	}
+	<-done
 	return data
 }
 
