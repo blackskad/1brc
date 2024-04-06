@@ -50,6 +50,33 @@ func (m *measurement) Merge(m1 *measurement) {
 	m.count += m1.count
 }
 
+type measurements map[uint64]*measurement
+
+func (ms measurements) Add(name []byte, temp int64) {
+	var h = fnv.New64a()
+	h.Reset()
+	h.Write(name)
+	id := h.Sum64()
+
+	station, ok := ms[id]
+	if !ok {
+		ms[id] = &measurement{string(name), temp, temp, temp, 1}
+	} else {
+		station.Add(temp)
+	}
+}
+
+func (ms measurements) Merge(res measurements) {
+	for id, m := range res {
+		station, ok := ms[id]
+		if !ok {
+			ms[id] = m
+		} else {
+			station.Merge(m)
+		}
+	}
+}
+
 func main() {
 	f, err := os.Create("cpu_profile.prof")
 	if err != nil {
@@ -76,20 +103,20 @@ func main() {
 	}
 	defer file.Close()
 
-	data := collectData(file)
+	data := collectData(file, blockSize, runtime.NumCPU()-1)
 	printMeasurements(data)
 }
 
 // TODO: see if this can be further optimised, reads don't show up in the trace though
 const blockSize = 1024 * 1024 * 1024
 
-func collectData(file io.Reader) map[uint64]*measurement {
+func collectData(file io.Reader, blockSize int, parallellism int) map[uint64]*measurement {
 	var wg sync.WaitGroup
 	results := make(chan map[uint64]*measurement)
 
 	// Spin up a limited number of goroutines to limit scheduling issues between them
 	inputs := make(chan []byte)
-	for i := 0; i < runtime.NumCPU()-1; i++ {
+	for i := 0; i < parallellism; i++ {
 		wg.Add(1)
 		go func() {
 			for input := range inputs {
@@ -101,17 +128,10 @@ func collectData(file io.Reader) map[uint64]*measurement {
 
 	// One goroutine to collect all the result sets into one
 	done := make(chan struct{})
-	data := make(map[uint64]*measurement)
+	data := measurements(make(map[uint64]*measurement))
 	go func() {
 		for res := range results {
-			for id, m := range res {
-				station, ok := data[id]
-				if !ok {
-					data[id] = m
-				} else {
-					station.Merge(m)
-				}
-			}
+			data.Merge(res)
 		}
 		close(done)
 	}()
@@ -142,7 +162,7 @@ func collectData(file io.Reader) map[uint64]*measurement {
 		inputs <- b1[:ns+1]
 
 		// Create a new block for the next goroutine
-		b2, b1 = b1, make([]byte, 1024*1024*1024)
+		b2, b1 = b1, make([]byte, blockSize)
 		copy(b1[0:(offset+n)-(ns+1)], b2[ns+1:offset+n])
 		offset = (offset + n) - (ns + 1)
 	}
@@ -157,9 +177,11 @@ func collectData(file io.Reader) map[uint64]*measurement {
 }
 
 func process(b []byte) map[uint64]*measurement {
-	data := make(map[uint64]*measurement)
+	data := measurements(make(map[uint64]*measurement))
 
-	var h = fnv.New64a()
+	if len(b) > 0 && b[0] == '\n' {
+		b = b[1:]
+	}
 
 	var ns, ne int
 	for i := 0; i < len(b); i++ {
@@ -167,19 +189,9 @@ func process(b []byte) map[uint64]*measurement {
 		case ';':
 			ne = i
 		case '\n':
-			name := b[ns:ne]
 			temperature := int64(parseTemperature(b[ne+1 : i]))
 
-			h.Reset()
-			h.Write(name)
-			id := h.Sum64()
-
-			station, ok := data[id]
-			if !ok {
-				data[id] = &measurement{string(name), temperature, temperature, temperature, 1}
-			} else {
-				station.Add(temperature)
-			}
+			data.Add(b[ns:ne], temperature)
 			ns = i + 1
 		}
 	}
