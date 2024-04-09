@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"log"
 	"math"
+	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"runtime"
@@ -78,20 +80,22 @@ func (ms measurements) Merge(res measurements) {
 }
 
 func main() {
-	f, err := os.Create("cpu_profile.prof")
-	if err != nil {
-		panic(err)
-	}
-	defer f.Close()
+	if os.Getenv("ENABLE_PROFILING") != "" {
+		f, err := os.Create("cpu_profile.prof")
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
 
-	if err := pprof.StartCPUProfile(f); err != nil {
-		panic(err)
-	}
-	defer pprof.StopCPUProfile()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			panic(err)
+		}
+		defer pprof.StopCPUProfile()
 
-	// go func() {
-	// 	log.Println(http.ListenAndServe("localhost:6060", nil))
-	// }()
+		go func() {
+			log.Println(http.ListenAndServe("localhost:6060", nil))
+		}()
+	}
 
 	if len(os.Args) != 2 {
 		panic("missing measurements filename")
