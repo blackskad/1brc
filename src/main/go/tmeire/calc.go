@@ -30,17 +30,6 @@ func (m *measurement) Print() {
 	)
 }
 
-func (m *measurement) Add(temperature int64) {
-	if temperature < m.min {
-		m.min = temperature
-	}
-	if temperature > m.max {
-		m.max = temperature
-	}
-	m.sum += temperature
-	m.count++
-}
-
 func (m *measurement) Merge(m1 *measurement) {
 	if m1.min < m.min {
 		m.min = m1.min
@@ -53,20 +42,6 @@ func (m *measurement) Merge(m1 *measurement) {
 }
 
 type measurements map[uint64]*measurement
-
-func (ms measurements) Add(name []byte, temp int64) {
-	var h = fnv.New64a()
-	h.Reset()
-	h.Write(name)
-	id := h.Sum64()
-
-	station, ok := ms[id]
-	if !ok {
-		ms[id] = &measurement{string(name), temp, temp, temp, 1}
-	} else {
-		station.Add(temp)
-	}
-}
 
 func (ms measurements) Merge(res measurements) {
 	for id, m := range res {
@@ -183,6 +158,8 @@ func collectData(file io.Reader, blockSize int, parallellism int) map[uint64]*me
 func process(b []byte) map[uint64]*measurement {
 	data := measurements(make(map[uint64]*measurement))
 
+	var h = fnv.New64a()
+
 	if len(b) > 0 && b[0] == '\n' {
 		b = b[1:]
 	}
@@ -193,9 +170,26 @@ func process(b []byte) map[uint64]*measurement {
 		case ';':
 			ne = i
 		case '\n':
+			name := b[ns:ne]
 			temperature := int64(parseTemperature(b[ne+1 : i]))
 
-			data.Add(b[ns:ne], temperature)
+			h.Reset()
+			h.Write(name)
+			id := h.Sum64()
+
+			station, ok := data[id]
+			if !ok {
+				data[id] = &measurement{string(name), temperature, temperature, temperature, 1}
+			} else {
+				if temperature < station.min {
+					station.min = temperature
+				}
+				if temperature > station.max {
+					station.max = temperature
+				}
+				station.sum += temperature
+				station.count++
+			}
 			ns = i + 1
 		}
 	}
