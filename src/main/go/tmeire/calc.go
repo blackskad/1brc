@@ -18,7 +18,8 @@ import (
 )
 
 type measurement struct {
-	id uint64
+	id          uint64
+	left, right int
 
 	name                 string
 	min, max, sum, count int64
@@ -221,18 +222,15 @@ func parseTemperature(temp []byte) int64 {
 type Map struct {
 	data []measurement
 	h    hash.Hash64
-	keys int64
+	keys int
 
-	asc, desc bool
-	prev      uint64
+	min, max int
 }
 
 func New() *Map {
 	return &Map{
 		data: make([]measurement, 1_000_000),
 		h:    fnv.New64a(),
-		asc:  true,
-		desc: true,
 	}
 }
 
@@ -241,26 +239,12 @@ func (m *Map) Add(name []byte, temperature int64) {
 	m.h.Write(name)
 	id := m.h.Sum64()
 
-	if m.keys == 0 {
-		//
+	if len(m.data) == m.keys {
+		panic("data map is full")
 	}
 
-	var idx, last int
-	switch {
-	case m.keys == 0:
-		idx = len(m.data) / 2.
-	case m.asc && m.prev < id:
-		idx = (len(m.data) / 2.) + int(m.keys) + 1
-	case m.desc && m.prev > id:
-		idx = (len(m.data) / 2.) - int(m.keys) - 1
-	default:
-		idx = len(m.data) / 2.
-		last = len(m.data) - 1
-
-		m.asc, m.desc = false, false
-	}
-
-	for idx != last {
+	idx := 0
+	for {
 		switch {
 		case m.data[idx].id == id:
 			if temperature < m.data[idx].min {
@@ -274,21 +258,26 @@ func (m *Map) Add(name []byte, temperature int64) {
 			return
 		case m.data[idx].id == 0:
 			m.data[idx].id = id
+			m.data[idx].left = -1
+			m.data[idx].right = -1
+
 			m.data[idx].name = string(name)
 			m.data[idx].min = temperature
 			m.data[idx].max = temperature
 			m.data[idx].sum += temperature
 			m.data[idx].count++
 			m.keys++
-			m.prev = id
 			return
 		case m.data[idx].id < id:
-			last, idx = idx, idx/2.
+			if m.data[idx].right == -1 {
+				m.data[idx].right = m.keys
+			}
+			idx = m.data[idx].right
 		case m.data[idx].id > id:
-			last, idx = idx, (last+idx)/2.
+			if m.data[idx].left == -1 {
+				m.data[idx].left = m.keys
+			}
+			idx = m.data[idx].left
 		}
 	}
-	// TODO: we would have to resize the slice and reorganize all the data.
-	// Let's see if we can trade this memory over a rebalancing algorithm.
-	panic(fmt.Sprintf("slice not big enough! (keys: %d, size: %d)", m.keys, len(m.data)))
 }
