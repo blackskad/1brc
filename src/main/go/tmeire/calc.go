@@ -231,6 +231,8 @@ func New() *Map {
 	return &Map{
 		data: make([]measurement, 1_000_000),
 		h:    fnv.New64a(),
+		min:  -1,
+		max:  -1,
 	}
 }
 
@@ -243,7 +245,22 @@ func (m *Map) Add(name []byte, temperature int64) {
 		panic("data map is full")
 	}
 
-	idx := 0
+	var idx int
+	switch {
+	case m.keys == 0:
+		m.min = 0
+		m.max = 0
+		idx = 0
+	case id < m.data[m.min].id:
+		m.data[m.min].left = m.keys
+		m.min = m.keys
+		idx = m.keys
+	case id > m.data[m.max].id:
+		m.data[m.max].right = m.keys
+		m.max = m.keys
+		idx = m.keys
+	}
+
 	for {
 		switch {
 		case m.data[idx].id == id:
