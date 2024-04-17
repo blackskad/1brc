@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"hash"
 	"hash/fnv"
 	"io"
 	"log"
@@ -17,6 +18,8 @@ import (
 )
 
 type measurement struct {
+	id uint64
+
 	name                 string
 	min, max, sum, count int64
 }
@@ -43,14 +46,17 @@ func (m *measurement) Merge(m1 *measurement) {
 
 type measurements map[uint64]*measurement
 
-func (ms measurements) Merge(res measurements) {
-	for id, m := range res {
-		station, ok := ms[id]
-		if !ok {
-			ms[id] = m
-		} else {
-			station.Merge(m)
+func (ms measurements) Merge(res *Map) {
+	for _, m := range res.data {
+		if m.id == 0 {
+			continue
 		}
+		station, ok := ms[m.id]
+		if !ok {
+			ms[m.id] = &m
+			continue
+		}
+		station.Merge(&m)
 	}
 }
 
@@ -91,7 +97,7 @@ const blockSize = 1024 * 1024 * 1024
 
 func collectData(file io.Reader, blockSize int, parallellism int) map[uint64]*measurement {
 	var wg sync.WaitGroup
-	results := make(chan map[uint64]*measurement)
+	results := make(chan *Map)
 
 	// Spin up a limited number of goroutines to limit scheduling issues between them
 	inputs := make(chan []byte)
@@ -155,10 +161,8 @@ func collectData(file io.Reader, blockSize int, parallellism int) map[uint64]*me
 	return data
 }
 
-func process(b []byte) map[uint64]*measurement {
-	data := measurements(make(map[uint64]*measurement))
-
-	var h = fnv.New64a()
+func process(b []byte) *Map {
+	data := New()
 
 	if len(b) > 0 && b[0] == '\n' {
 		b = b[1:]
@@ -173,23 +177,7 @@ func process(b []byte) map[uint64]*measurement {
 			name := b[ns:ne]
 			temperature := int64(parseTemperature(b[ne+1 : i]))
 
-			h.Reset()
-			h.Write(name)
-			id := h.Sum64()
-
-			station, ok := data[id]
-			if !ok {
-				data[id] = &measurement{string(name), temperature, temperature, temperature, 1}
-			} else {
-				if temperature < station.min {
-					station.min = temperature
-				}
-				if temperature > station.max {
-					station.max = temperature
-				}
-				station.sum += temperature
-				station.count++
-			}
+			data.Add(name, temperature)
 			ns = i + 1
 		}
 	}
@@ -228,4 +216,79 @@ func parseTemperature(temp []byte) int64 {
 		return -n
 	}
 	return n
+}
+
+type Map struct {
+	data []measurement
+	h    hash.Hash64
+	keys int64
+
+	asc, desc bool
+	prev      uint64
+}
+
+func New() *Map {
+	return &Map{
+		data: make([]measurement, 1_000_000),
+		h:    fnv.New64a(),
+		asc:  true,
+		desc: true,
+	}
+}
+
+func (m *Map) Add(name []byte, temperature int64) {
+	m.h.Reset()
+	m.h.Write(name)
+	id := m.h.Sum64()
+
+	if m.keys == 0 {
+		//
+	}
+
+	var idx, last int
+	switch {
+	case m.keys == 0:
+		idx = len(m.data) / 2.
+	case m.asc && m.prev < id:
+		idx = (len(m.data) / 2.) + int(m.keys) + 1
+	case m.desc && m.prev > id:
+		idx = (len(m.data) / 2.) - int(m.keys) - 1
+	default:
+		idx = len(m.data) / 2.
+		last = len(m.data) - 1
+
+		m.asc, m.desc = false, false
+	}
+
+	for idx != last {
+		switch {
+		case m.data[idx].id == id:
+			if temperature < m.data[idx].min {
+				m.data[idx].min = temperature
+			}
+			if temperature > m.data[idx].max {
+				m.data[idx].max = temperature
+			}
+			m.data[idx].sum += temperature
+			m.data[idx].count++
+			return
+		case m.data[idx].id == 0:
+			m.data[idx].id = id
+			m.data[idx].name = string(name)
+			m.data[idx].min = temperature
+			m.data[idx].max = temperature
+			m.data[idx].sum += temperature
+			m.data[idx].count++
+			m.keys++
+			m.prev = id
+			return
+		case m.data[idx].id < id:
+			last, idx = idx, idx/2.
+		case m.data[idx].id > id:
+			last, idx = idx, (last+idx)/2.
+		}
+	}
+	// TODO: we would have to resize the slice and reorganize all the data.
+	// Let's see if we can trade this memory over a rebalancing algorithm.
+	panic(fmt.Sprintf("slice not big enough! (keys: %d, size: %d)", m.keys, len(m.data)))
 }
