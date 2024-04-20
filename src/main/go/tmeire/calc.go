@@ -18,8 +18,9 @@ import (
 )
 
 type measurement struct {
-	id          uint64
-	left, right int
+	id                  uint64
+	depth               int
+	parent, left, right int
 
 	name                 string
 	min, max, sum, count int64
@@ -245,18 +246,20 @@ func (m *Map) Add(name []byte, temperature int64) {
 		panic("data map is full")
 	}
 
-	var idx int
+	var parent, idx int
 	switch {
 	case m.keys == 0:
 		m.min = 0
 		m.max = 0
-		idx = 0
+		parent, idx = -1, 0
 	case id < m.data[m.min].id:
 		m.data[m.min].left = m.keys
+		parent = m.min
 		m.min = m.keys
 		idx = m.keys
 	case id > m.data[m.max].id:
 		m.data[m.max].right = m.keys
+		parent = m.max
 		m.max = m.keys
 		idx = m.keys
 	}
@@ -275,6 +278,7 @@ func (m *Map) Add(name []byte, temperature int64) {
 			return
 		case m.data[idx].id == 0:
 			m.data[idx].id = id
+			m.data[idx].parent = parent
 			m.data[idx].left = -1
 			m.data[idx].right = -1
 
@@ -284,17 +288,96 @@ func (m *Map) Add(name []byte, temperature int64) {
 			m.data[idx].sum += temperature
 			m.data[idx].count++
 			m.keys++
+
+			m.rebalance(parent)
 			return
 		case m.data[idx].id < id:
 			if m.data[idx].right == -1 {
 				m.data[idx].right = m.keys
 			}
-			idx = m.data[idx].right
+			parent, idx = idx, m.data[idx].right
 		case m.data[idx].id > id:
 			if m.data[idx].left == -1 {
 				m.data[idx].left = m.keys
 			}
-			idx = m.data[idx].left
+			parent, idx = idx, m.data[idx].left
 		}
 	}
+}
+
+func (m *Map) rebalance(idx int) {
+	if idx == -1 {
+		return
+	}
+
+	defer func() {
+		// Call rebalance with the parent index, to make sure all depths are updated
+		if m.data[idx].parent != -1 {
+			m.rebalance(m.data[idx].parent)
+		}
+	}()
+
+	n := m.data[idx]
+
+	var ld, rd int
+	ld, rd, n.depth = m.depth(idx)
+
+	if ld == rd || (ld > rd && ld-rd < 2) || (ld < rd && rd-ld < 2) {
+		// No need to rebalance yet
+		return
+	}
+
+	if ld > rd {
+		// Left child node gets moved up
+		l := m.data[n.left]
+		p := m.data[n.parent]
+
+		l.parent = n.parent
+		n.parent = n.left
+		n.left = l.right
+		l.right = idx
+
+		if p.left == idx {
+			p.left = n.parent
+		} else {
+			p.right = n.parent
+		}
+		_, _, n.depth = m.depth(idx)
+		_, _, l.depth = m.depth(n.parent)
+		_, _, p.depth = m.depth(l.parent)
+
+	} else {
+		// Right child node gets moved up
+		r := m.data[n.right]
+		p := m.data[n.parent]
+
+		r.parent = n.parent
+		n.parent = n.right
+		n.right = r.left
+		r.left = idx
+
+		if p.left == idx {
+			p.left = n.parent
+		} else {
+			p.right = n.parent
+		}
+		_, _, n.depth = m.depth(idx)
+		_, _, r.depth = m.depth(n.parent)
+		_, _, p.depth = m.depth(r.parent)
+	}
+}
+
+func (m *Map) depth(idx int) (int, int, int) {
+	n := m.data[idx]
+
+	ld := -1
+	if n.left != -1 {
+		ld = m.data[n.left].depth
+	}
+	rd := -1
+	if n.right != -1 {
+		rd = m.data[n.right].depth
+	}
+
+	return ld, rd, max(ld, rd) + 1
 }
