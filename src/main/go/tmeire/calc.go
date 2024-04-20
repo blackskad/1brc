@@ -289,7 +289,7 @@ func (m *Map) Add(name []byte, temperature int64) {
 			m.data[idx].count++
 			m.keys++
 
-			m.rebalance(parent)
+			//m.rebalance(parent)
 			return
 		case m.data[idx].id < id:
 			if m.data[idx].right == -1 {
