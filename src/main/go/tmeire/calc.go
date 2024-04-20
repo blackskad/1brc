@@ -1,10 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
-	"hash"
-	"hash/fnv"
 	"io"
 	"log"
 	"math"
@@ -13,22 +12,18 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
-	"sort"
+	"slices"
 	"sync"
 )
 
 type measurement struct {
-	id                  uint64
-	depth               int
-	parent, left, right int
-
-	name                 string
+	name                 []byte
 	min, max, sum, count int64
 }
 
 func (m *measurement) Print() {
 	fmt.Printf("%s=%.1f/%.1f/%.1f, ",
-		m.name,
+		string(m.name),
 		float64(m.min)/10.,
 		math.Round(float64(m.sum)/float64(m.count))/10.,
 		float64(m.max)/10.,
@@ -44,22 +39,6 @@ func (m *measurement) Merge(m1 *measurement) {
 	}
 	m.sum += m1.sum
 	m.count += m1.count
-}
-
-type measurements map[uint64]*measurement
-
-func (ms measurements) Merge(res *Map) {
-	for _, m := range res.data {
-		if m.id == 0 {
-			continue
-		}
-		station, ok := ms[m.id]
-		if !ok {
-			ms[m.id] = &m
-			continue
-		}
-		station.Merge(&m)
-	}
 }
 
 func main() {
@@ -97,9 +76,9 @@ func main() {
 // TODO: see if this can be further optimised, reads don't show up in the trace though
 const blockSize = 1024 * 1024 * 1024
 
-func collectData(file io.Reader, blockSize int, parallellism int) map[uint64]*measurement {
+func collectData(file io.Reader, blockSize int, parallellism int) measurements {
 	var wg sync.WaitGroup
-	results := make(chan *Map)
+	results := make(chan measurements)
 
 	// Spin up a limited number of goroutines to limit scheduling issues between them
 	inputs := make(chan []byte)
@@ -115,7 +94,7 @@ func collectData(file io.Reader, blockSize int, parallellism int) map[uint64]*me
 
 	// One goroutine to collect all the result sets into one
 	done := make(chan struct{})
-	data := measurements(make(map[uint64]*measurement))
+	data := New()
 	go func() {
 		for res := range results {
 			data.Merge(res)
@@ -163,7 +142,7 @@ func collectData(file io.Reader, blockSize int, parallellism int) map[uint64]*me
 	return data
 }
 
-func process(b []byte) *Map {
+func process(b []byte) measurements {
 	data := New()
 
 	if len(b) > 0 && b[0] == '\n' {
@@ -186,19 +165,18 @@ func process(b []byte) *Map {
 	return data
 }
 
-func printMeasurements(data map[uint64]*measurement) {
-	// Not worth optimizing at this point
-	indexes := make(map[string]uint64)
-	keys := make([]string, 0, len(data))
-	for id, m := range data {
-		keys = append(keys, m.name)
-		indexes[m.name] = id
-	}
-	sort.Strings(keys)
+func printMeasurements(data measurements) {
+	results := data.Flatten()
+	slices.SortFunc(results, func(m1 *measurement, m2 *measurement) int {
+		if string(m1.name) < string(m2.name) {
+			return -1
+		}
+		return 1
+	})
 
 	print("{")
-	for _, k := range keys {
-		data[indexes[k]].Print()
+	for _, k := range results {
+		k.Print()
 	}
 	print("}\n")
 }
@@ -220,164 +198,80 @@ func parseTemperature(temp []byte) int64 {
 	return n
 }
 
-type Map struct {
-	data []measurement
-	h    hash.Hash64
-	keys int
+func hash(name []byte) uint16 {
+	l := min(len(name), 8)
 
-	min, max int
+	var id uint16
+	for _, b := range name[len(name)-l:] {
+		id = id << 8 & uint16(b)
+	}
+	return id
 }
 
-func New() *Map {
-	return &Map{
-		data: make([]measurement, 1_000_000),
-		h:    fnv.New64a(),
-		min:  -1,
-		max:  -1,
-	}
+type measurements []bucket
+
+func New() measurements {
+	return make([]bucket, math.MaxUint16)
 }
 
-func (m *Map) Add(name []byte, temperature int64) {
-	m.h.Reset()
-	m.h.Write(name)
-	id := m.h.Sum64()
+func (mm measurements) Merge(res measurements) {
+	for _, vals := range res {
+		for _, m := range vals {
+			h := hash(m.name)
 
-	if len(m.data) == m.keys {
-		panic("data map is full")
-	}
-
-	var parent, idx int
-	switch {
-	case m.keys == 0:
-		m.min = 0
-		m.max = 0
-		parent, idx = -1, 0
-	case id < m.data[m.min].id:
-		m.data[m.min].left = m.keys
-		parent = m.min
-		m.min = m.keys
-		idx = m.keys
-	case id > m.data[m.max].id:
-		m.data[m.max].right = m.keys
-		parent = m.max
-		m.max = m.keys
-		idx = m.keys
-	}
-
-	for {
-		switch {
-		case m.data[idx].id == id:
-			if temperature < m.data[idx].min {
-				m.data[idx].min = temperature
-			}
-			if temperature > m.data[idx].max {
-				m.data[idx].max = temperature
-			}
-			m.data[idx].sum += temperature
-			m.data[idx].count++
-			return
-		case m.data[idx].id == 0:
-			m.data[idx].id = id
-			m.data[idx].parent = parent
-			m.data[idx].left = -1
-			m.data[idx].right = -1
-
-			m.data[idx].name = string(name)
-			m.data[idx].min = temperature
-			m.data[idx].max = temperature
-			m.data[idx].sum += temperature
-			m.data[idx].count++
-			m.keys++
-
-			//m.rebalance(parent)
-			return
-		case m.data[idx].id < id:
-			if m.data[idx].right == -1 {
-				m.data[idx].right = m.keys
-			}
-			parent, idx = idx, m.data[idx].right
-		case m.data[idx].id > id:
-			if m.data[idx].left == -1 {
-				m.data[idx].left = m.keys
-			}
-			parent, idx = idx, m.data[idx].left
+			mm[h] = mm[h].Add(m)
 		}
 	}
 }
 
-func (m *Map) rebalance(idx int) {
-	if idx == -1 {
-		return
-	}
-
-	defer func() {
-		// Call rebalance with the parent index, to make sure all depths are updated
-		if m.data[idx].parent != -1 {
-			m.rebalance(m.data[idx].parent)
+func (m measurements) Flatten() []*measurement {
+	var res []*measurement
+	for _, b := range m {
+		for _, mm := range b {
+			res = append(res, mm)
 		}
-	}()
-
-	n := m.data[idx]
-
-	var ld, rd int
-	ld, rd, n.depth = m.depth(idx)
-
-	if ld == rd || (ld > rd && ld-rd < 2) || (ld < rd && rd-ld < 2) {
-		// No need to rebalance yet
-		return
 	}
-
-	if ld > rd {
-		// Left child node gets moved up
-		l := m.data[n.left]
-		p := m.data[n.parent]
-
-		l.parent = n.parent
-		n.parent = n.left
-		n.left = l.right
-		l.right = idx
-
-		if p.left == idx {
-			p.left = n.parent
-		} else {
-			p.right = n.parent
-		}
-		_, _, n.depth = m.depth(idx)
-		_, _, l.depth = m.depth(n.parent)
-		_, _, p.depth = m.depth(l.parent)
-
-	} else {
-		// Right child node gets moved up
-		r := m.data[n.right]
-		p := m.data[n.parent]
-
-		r.parent = n.parent
-		n.parent = n.right
-		n.right = r.left
-		r.left = idx
-
-		if p.left == idx {
-			p.left = n.parent
-		} else {
-			p.right = n.parent
-		}
-		_, _, n.depth = m.depth(idx)
-		_, _, r.depth = m.depth(n.parent)
-		_, _, p.depth = m.depth(r.parent)
-	}
+	return res
 }
 
-func (m *Map) depth(idx int) (int, int, int) {
-	n := m.data[idx]
+func (m measurements) Add(name []byte, temperature int64) {
+	id := hash(name)
 
-	ld := -1
-	if n.left != -1 {
-		ld = m.data[n.left].depth
+	m[id] = m[id].AddNew(name, temperature)
+}
+
+type bucket []*measurement
+
+func (b bucket) Add(m *measurement) bucket {
+	for _, d := range b {
+		if bytes.Equal(d.name, m.name) {
+			d.Merge(m)
+			return b
+		}
 	}
-	rd := -1
-	if n.right != -1 {
-		rd = m.data[n.right].depth
+	return append(b, m)
+}
+
+func (b bucket) AddNew(name []byte, temperature int64) bucket {
+	for _, d := range b {
+		if bytes.Equal(name, d.name) {
+			if temperature < d.min {
+				d.min = temperature
+			}
+			if temperature > d.max {
+				d.max = temperature
+			}
+			d.sum += temperature
+			d.count++
+			return b
+		}
 	}
 
-	return ld, rd, max(ld, rd) + 1
+	return append(b, &measurement{
+		name:  name,
+		min:   temperature,
+		max:   temperature,
+		sum:   temperature,
+		count: 1,
+	})
 }
