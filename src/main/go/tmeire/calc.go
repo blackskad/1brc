@@ -202,8 +202,12 @@ func hash(name []byte) uint16 {
 	l := min(len(name), 8)
 
 	var id uint16
-	for _, b := range name[len(name)-l:] {
-		id = id << 8 & uint16(b)
+	for idx, b := range name[len(name)-l:] {
+		val := uint16(b)
+		if idx%2 == 0 {
+			val = val << 8
+		}
+		id = id & val
 	}
 	return id
 }
