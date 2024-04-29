@@ -1,9 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
+	"hash"
+	"hash/fnv"
 	"io"
 	"log"
 	"math"
@@ -19,6 +20,7 @@ import (
 type measurement struct {
 	name                 []byte
 	min, max, sum, count int64
+	hash                 uint64
 }
 
 func (m *measurement) Print() {
@@ -198,7 +200,7 @@ func parseTemperature(temp []byte) int64 {
 	return n
 }
 
-func hash(name []byte) uint16 {
+func namehash(name []byte) uint16 {
 	l := min(len(name), 8)
 
 	var id uint16
@@ -212,18 +214,20 @@ func hash(name []byte) uint16 {
 	return id
 }
 
-type measurements []bucket
+type measurements []*bucket
 
 func New() measurements {
-	return make([]bucket, math.MaxUint16)
+	return make([]*bucket, math.MaxUint16)
 }
 
 func (mm measurements) Merge(res measurements) {
-	for _, vals := range res {
-		for _, m := range vals {
-			h := hash(m.name)
-
-			mm[h] = mm[h].Add(m)
+	for h, b := range res {
+		if mm[h] == nil {
+			mm[h] = b
+			continue
+		}
+		for _, m := range b.data {
+			mm[h].Add(m)
 		}
 	}
 }
@@ -231,34 +235,46 @@ func (mm measurements) Merge(res measurements) {
 func (m measurements) Flatten() []*measurement {
 	var res []*measurement
 	for _, b := range m {
-		for _, mm := range b {
-			res = append(res, mm)
+		if b != nil {
+			for _, mm := range b.data {
+				res = append(res, mm)
+			}
 		}
 	}
 	return res
 }
 
 func (m measurements) Add(name []byte, temperature int64) {
-	id := hash(name)
+	id := namehash(name)
 
-	m[id] = m[id].AddNew(name, temperature)
+	if m[id] == nil {
+		m[id] = &bucket{fnv.New64a(), nil}
+	}
+	m[id].AddNew(name, temperature)
 }
 
-type bucket []*measurement
+type bucket struct {
+	hasher hash.Hash64
+	data   []*measurement
+}
 
-func (b bucket) Add(m *measurement) bucket {
-	for _, d := range b {
-		if bytes.Equal(d.name, m.name) {
+func (b *bucket) Add(m *measurement) {
+	for _, d := range b.data {
+		if m.hash == d.hash {
 			d.Merge(m)
-			return b
+			return
 		}
 	}
-	return append(b, m)
+	b.data = append(b.data, m)
 }
 
-func (b bucket) AddNew(name []byte, temperature int64) bucket {
-	for _, d := range b {
-		if bytes.Equal(name, d.name) {
+func (b *bucket) AddNew(name []byte, temperature int64) {
+	b.hasher.Reset()
+	b.hasher.Write(name)
+	hname := b.hasher.Sum64()
+
+	for _, d := range b.data {
+		if hname == d.hash {
 			if temperature < d.min {
 				d.min = temperature
 			}
@@ -267,12 +283,13 @@ func (b bucket) AddNew(name []byte, temperature int64) bucket {
 			}
 			d.sum += temperature
 			d.count++
-			return b
+			return
 		}
 	}
 
-	return append(b, &measurement{
+	b.data = append(b.data, &measurement{
 		name:  name,
+		hash:  hname,
 		min:   temperature,
 		max:   temperature,
 		sum:   temperature,
