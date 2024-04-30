@@ -80,29 +80,19 @@ const blockSize = 1024 * 1024 * 1024
 
 func collectData(file io.Reader, blockSize int, parallellism int) measurements {
 	var wg sync.WaitGroup
-	results := make(chan measurements)
+	results := make(chan measurements, 1)
 
 	// Spin up a limited number of goroutines to limit scheduling issues between them
 	inputs := make(chan []byte)
 	for i := 0; i < parallellism; i++ {
 		wg.Add(1)
-		go func() {
-			for input := range inputs {
-				results <- process(input)
-			}
-			wg.Done()
-		}()
+		go processBlocks(inputs, results, &wg)
 	}
 
 	// One goroutine to collect all the result sets into one
 	done := make(chan struct{})
 	data := New()
-	go func() {
-		for res := range results {
-			data.Merge(res)
-		}
-		close(done)
-	}()
+	go collect(data, results, done)
 
 	var offset int
 	var b1 = make([]byte, blockSize)
@@ -144,9 +134,24 @@ func collectData(file io.Reader, blockSize int, parallellism int) measurements {
 	return data
 }
 
-func process(b []byte) measurements {
+func collect(data measurements, results <-chan measurements, done chan struct{}) {
+	for res := range results {
+		data.Merge(res)
+	}
+	close(done)
+}
+
+func processBlocks(inputs <-chan []byte, results chan<- measurements, wg *sync.WaitGroup) {
 	data := New()
 
+	for input := range inputs {
+		process(data, input)
+	}
+	results <- data
+	wg.Done()
+}
+
+func process(data measurements, b []byte) {
 	if len(b) > 0 && b[0] == '\n' {
 		b = b[1:]
 	}
@@ -164,7 +169,6 @@ func process(b []byte) measurements {
 			ns = i + 1
 		}
 	}
-	return data
 }
 
 func printMeasurements(data measurements) {
