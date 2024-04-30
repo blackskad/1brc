@@ -205,7 +205,7 @@ func parseTemperature(temp []byte) int64 {
 }
 
 func namehash(name []byte) uint16 {
-	l := min(len(name), 8)
+	l := min(len(name), 4)
 
 	var id uint16
 	for idx, b := range name[len(name)-l:] {
@@ -226,6 +226,9 @@ func New() measurements {
 
 func (mm measurements) Merge(res measurements) {
 	for h, b := range res {
+		if b == nil {
+			continue
+		}
 		if mm[h] == nil {
 			mm[h] = b
 			continue
